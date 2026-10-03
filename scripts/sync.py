@@ -161,8 +161,16 @@ def sync(source_url: str, destination_url: str, branches: list[str], destination
             raise SyncError(f"Selected source branch(es) not found: {', '.join(missing_source)}.")
 
         source_refspecs = [f"+refs/heads/{branch}:refs/heads/{branch}" for branch in branches]
-        _git(["fetch", "--quiet", "--no-tags", "--no-recurse-submodules", source_url, *source_refspecs],
+        source_refspecs.append("+refs/tags/*:refs/tags/*")
+        _git(["fetch", "--quiet", "--no-recurse-submodules", source_url, *source_refspecs],
              env=source_auth, cwd=repository)
+
+        source_tags = _git(["for-each-ref", "--format=%(refname) %(objectname)", "refs/tags/"],
+                           env={}, cwd=repository)
+        source_tag_refs: dict[str, str] = {}
+        for line in source_tags.splitlines():
+            ref, object_id = line.split(" ", 1)
+            source_tag_refs[ref] = object_id
 
         # Discover and fetch only selected destination branches. Missing branches are valid.
         remote_refs = _git(["ls-remote", "--heads", destination_url,
@@ -173,6 +181,18 @@ def sync(source_url: str, destination_url: str, branches: list[str], destination
             fields = line.split("\t", 1)
             if len(fields) == 2 and fields[1].startswith("refs/heads/"):
                 present.add(fields[1][len("refs/heads/"):])
+
+        destination_tags_output = _git(["ls-remote", "--tags", "--refs", destination_url],
+                                       env=destination_auth, cwd=repository)
+        destination_tags: dict[str, str] = {}
+        for line in destination_tags_output.splitlines():
+            fields = line.split("\t", 1)
+            if len(fields) == 2 and fields[1].startswith("refs/tags/"):
+                destination_tags[fields[1]] = fields[0]
+        for ref, object_id in source_tag_refs.items():
+            if ref in destination_tags and destination_tags[ref] != object_id:
+                tag_name = ref[len("refs/tags/"):]
+                raise SyncError(f"Tag {tag_name!r} conflicts with a different destination tag object; refusing to overwrite it.")
         destination_refspecs = [
             f"refs/heads/{branch}:refs/remotes/destination/{branch}" for branch in branches if branch in present
         ]
@@ -203,6 +223,7 @@ def sync(source_url: str, destination_url: str, branches: list[str], destination
                     raise SyncError(f"Could not compare selected branch {branch!r} with destination.")
 
         push_refspecs = [f"refs/heads/{branch}:refs/heads/{branch}" for branch in branches]
+        push_refspecs.extend(f"{ref}:{ref}" for ref in source_tag_refs)
         _git(["push", "--quiet", "--atomic", destination_url, *push_refspecs],
              env=destination_auth, cwd=repository)
 
@@ -226,7 +247,7 @@ def main() -> int:
     except SyncError as exc:
         print(f"Branch synchronization failed: {exc}", file=sys.stderr)
         return 1
-    print(f"Successfully synchronized {len(branches)} selected branch(es).")
+    print(f"Successfully synchronized {len(branches)} selected branch(es) and all source tags.")
     return 0
 
 

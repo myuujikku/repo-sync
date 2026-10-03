@@ -37,16 +37,19 @@ class SyncIntegrationTests(unittest.TestCase):
         git("push", "--quiet", "origin", "release", cwd=self.work)
         git("tag", "v1", cwd=self.work)
         git("push", "--quiet", "origin", "refs/tags/v1", cwd=self.work)
-        self.source_only_tag = git("rev-parse", "refs/tags/v1", cwd=self.work)
+        self.lightweight_tag = git("rev-parse", "refs/tags/v1", cwd=self.work)
+        git("switch", "--quiet", "--orphan", "tag-history", cwd=self.work)
+        self._commit("outside selected branches")
+        git("tag", "-a", "outside-history", "-m", "annotated tag", cwd=self.work)
+        git("push", "--quiet", "origin", "refs/tags/outside-history", cwd=self.work)
+        self.annotated_tag = git("rev-parse", "refs/tags/outside-history", cwd=self.work)
         git("switch", "--quiet", "main", cwd=self.work)
         (self.work / "destination-tag.txt").write_text("destination tag", encoding="utf-8")
         git("add", "destination-tag.txt", cwd=self.work)
         git("commit", "--quiet", "-m", "destination tag object", cwd=self.work)
-        git("tag", "-f", "v1", cwd=self.work)
-        self.destination_only_tag = git("rev-parse", "refs/tags/v1", cwd=self.work)
-        git("push", "--quiet", self.destination, "refs/tags/v1", cwd=self.work)
-        git("tag", "source-only", self.source_only_tag, cwd=self.work)
-        git("push", "--quiet", "origin", "refs/tags/source-only", cwd=self.work)
+        git("tag", "destination-only", cwd=self.work)
+        self.destination_only_tag = git("rev-parse", "refs/tags/destination-only", cwd=self.work)
+        git("push", "--quiet", self.destination, "refs/tags/destination-only", cwd=self.work)
 
     def tearDown(self):
         self.temp.cleanup()
@@ -62,7 +65,7 @@ class SyncIntegrationTests(unittest.TestCase):
     def _destination_refs(self):
         return git("ls-remote", "--heads", self.destination).splitlines()
 
-    def test_initial_multiple_branches_preserves_destination_only_branch_and_tags(self):
+    def test_initial_multiple_branches_syncs_all_tags_and_preserves_destination_only_refs(self):
         git("push", "--quiet", self.destination, "HEAD:refs/heads/destination-only", cwd=self.work)
         destination_tag = {line.split("\t")[1]: line.split("\t")[0]
                            for line in git("ls-remote", "--tags", self.destination).splitlines()}
@@ -80,10 +83,12 @@ class SyncIntegrationTests(unittest.TestCase):
                           for sha, ref in [line.split("\t")]}[f"refs/heads/{branch}"]
             self.assertEqual(refs[f"refs/heads/{branch}"], source_sha)
         tags_after = {line.split("\t")[1]: line.split("\t")[0]
-                      for line in git("ls-remote", "--tags", self.destination).splitlines()}
-        self.assertEqual(tags_after, destination_tag)
-        self.assertEqual(tags_after, {"refs/tags/v1": self.destination_only_tag})
-        self.assertNotEqual(self.destination_only_tag, self.source_only_tag)
+                      for line in git("ls-remote", "--tags", "--refs", self.destination).splitlines()}
+        self.assertEqual(tags_after["refs/tags/destination-only"], self.destination_only_tag)
+        self.assertEqual(tags_after["refs/tags/v1"], self.lightweight_tag)
+        self.assertEqual(tags_after["refs/tags/outside-history"], self.annotated_tag)
+        self.assertEqual(tags_after["refs/tags/destination-only"], destination_tag["refs/tags/destination-only"])
+        self.assertEqual(set(tags_after), {"refs/tags/destination-only", "refs/tags/v1", "refs/tags/outside-history"})
 
     def test_subsequent_fast_forward_sync(self):
         self._sync()
@@ -95,6 +100,30 @@ class SyncIntegrationTests(unittest.TestCase):
         destination_sha = {ref: sha for line in self._destination_refs()
                            for sha, ref in [line.split("\t")]}["refs/heads/main"]
         self.assertEqual(destination_sha, source_sha)
+
+    def test_new_tags_are_synchronized_and_identical_tags_are_idempotent(self):
+        self._sync()
+        git("tag", "new-lightweight", "main", cwd=self.work)
+        git("tag", "-a", "new-annotated", "release", "-m", "new annotated tag", cwd=self.work)
+        git("push", "--quiet", "origin", "refs/tags/new-lightweight", "refs/tags/new-annotated", cwd=self.work)
+        self._sync()
+        expected = {"refs/tags/v1", "refs/tags/outside-history", "refs/tags/new-lightweight",
+                    "refs/tags/new-annotated"}
+        tags_before = {line.split("\t")[1]: line.split("\t")[0]
+                       for line in git("ls-remote", "--tags", "--refs", self.destination).splitlines()}
+        self.assertEqual(set(tags_before), expected | {"refs/tags/destination-only"})
+        self._sync()
+        tags_after = {line.split("\t")[1]: line.split("\t")[0]
+                      for line in git("ls-remote", "--tags", "--refs", self.destination).splitlines()}
+        self.assertEqual(tags_after, tags_before)
+
+    def test_no_source_tags_synchronizes_selected_branches(self):
+        git("init", "--bare", "--quiet", self.root / "no-tags.git")
+        git("push", "--quiet", self.root / "no-tags.git", "main", "release", cwd=self.work)
+        sync(str(self.root / "no-tags.git"), str(self.destination), ["main", "release"],
+             "destination-secret", require_https=False)
+        tags = git("ls-remote", "--tags", "--refs", self.destination).splitlines()
+        self.assertEqual({line.split("\t")[1] for line in tags}, {"refs/tags/destination-only"})
 
     def test_divergence_rejected_without_partial_push(self):
         self._sync()
@@ -111,16 +140,34 @@ class SyncIntegrationTests(unittest.TestCase):
         git("switch", "--quiet", "release", cwd=self.work)
         self._commit("release-2")
         git("push", "--quiet", "origin", "release", cwd=self.work)
+        git("tag", "new-before-divergence", "release", cwd=self.work)
+        git("push", "--quiet", "origin", "refs/tags/new-before-divergence", cwd=self.work)
         before = set(self._destination_refs())
+        tags_before = git("ls-remote", "--tags", "--refs", self.destination)
         with self.assertRaisesRegex(SyncError, "diverged"):
             self._sync()
         self.assertEqual(set(self._destination_refs()), before)
+        self.assertEqual(git("ls-remote", "--tags", "--refs", self.destination), tags_before)
 
     def test_missing_selected_source_branch_does_not_partially_push(self):
         before = set(self._destination_refs())
+        tags_before = git("ls-remote", "--tags", "--refs", self.destination)
         with self.assertRaises(SyncError):
             self._sync(("main", "does-not-exist"))
         self.assertEqual(set(self._destination_refs()), before)
+        self.assertEqual(git("ls-remote", "--tags", "--refs", self.destination), tags_before)
+
+    def test_tag_conflict_aborts_branch_and_tag_changes(self):
+        git("push", "--quiet", self.destination, "refs/heads/main:refs/heads/destination-only", cwd=self.work)
+        git("tag", "-f", "v1", "main", cwd=self.work)
+        git("push", "--quiet", self.destination, "refs/tags/v1", cwd=self.work)
+        before_branches = set(self._destination_refs())
+        before_tags = git("ls-remote", "--tags", "--refs", self.destination)
+        # The source v1 tag points to the release branch; destination v1 points to main.
+        with self.assertRaisesRegex(SyncError, "Tag 'v1' conflicts"):
+            self._sync()
+        self.assertEqual(set(self._destination_refs()), before_branches)
+        self.assertEqual(git("ls-remote", "--tags", "--refs", self.destination), before_tags)
 
 
 class ValidationTests(unittest.TestCase):
