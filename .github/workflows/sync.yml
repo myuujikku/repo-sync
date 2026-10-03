@@ -1,0 +1,32 @@
+name: Synchronize selected branches
+
+on:
+  schedule:
+    - cron: '17 */6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sync-selected-branches
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out workflow repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Synchronize selected branches
+        env:
+          SOURCE_REPO_URL: ${{ secrets.SOURCE_REPO_URL }}
+          DESTINATION_REPO_URL: ${{ secrets.DESTINATION_REPO_URL }}
+          SYNC_BRANCHES: ${{ secrets.SYNC_BRANCHES }}
+          DESTINATION_TOKEN: ${{ secrets.DESTINATION_TOKEN }}
+          SOURCE_USERNAME: ${{ secrets.SOURCE_USERNAME }}
+          SOURCE_TOKEN: ${{ secrets.SOURCE_TOKEN }}
+        run: python3 scripts/sync.py
